@@ -64,10 +64,43 @@ pub async fn run(config: &Config) -> Result<()> {
 
     let mut stream = futures_util::stream::iter(pending)
         .map(|pf| async move {
-            let data = tokio::fs::read(&pf.path_str).await
+            use std::io::SeekFrom;
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+            let mut file = tokio::fs::File::open(&pf.path_str).await
                 .map_err(|e| (pf.path_str.clone(), e.to_string()))?;
 
-            let result = tokio::task::spawn_blocking(move || mp3::count_frames(&data))
+            // Read the first 10 bytes to detect an ID3 header.
+            let mut lead = [0u8; 10];
+            file.read_exact(&mut lead).await
+                .map_err(|e| (pf.path_str.clone(), e.to_string()))?;
+
+            let id3_size = if &lead[0..3] == b"ID3" {
+                let sz = ((lead[6] as usize) << 21) | ((lead[7] as usize) << 14)
+                       | ((lead[8] as usize) <<  7) |  lead[9] as usize;
+                sz + 10
+            } else {
+                0
+            };
+
+            // Build a small probe buffer starting at the first audio byte.
+            // If no ID3, reuse the 10 bytes already read; otherwise seek past the tag.
+            let mut probe = vec![0u8; 2048];
+            let n = if id3_size == 0 {
+                probe[..10].copy_from_slice(&lead);
+                let rest = file.read(&mut probe[10..]).await
+                    .map_err(|e| (pf.path_str.clone(), e.to_string()))?;
+                10 + rest
+            } else {
+                file.seek(SeekFrom::Start(id3_size as u64)).await
+                    .map_err(|e| (pf.path_str.clone(), e.to_string()))?;
+                file.read(&mut probe).await
+                    .map_err(|e| (pf.path_str.clone(), e.to_string()))?
+            };
+            probe.truncate(n);
+
+            let audio_size = (pf.size_bytes as u64).saturating_sub(id3_size as u64);
+            let result = tokio::task::spawn_blocking(move || mp3::probe_duration(&probe, audio_size))
                 .await
                 .unwrap();
 

@@ -83,29 +83,56 @@ pub fn parse_frames(data: &[u8]) -> (Vec<Frame>, u32) {
     (frames, sample_rate)
 }
 
-/// Like `parse_frames` but only counts frames — no `Vec<Frame>` allocation.
-/// Used during library scanning where frame offsets are not needed.
-pub fn count_frames(data: &[u8]) -> Option<(u64, u32)> {
-    let mut i           = id3_skip(data);
-    let mut count       = 0u64;
-    let mut sample_rate = 0u32;
-
+/// Probe duration from a small buffer read at the start of the audio data
+/// (after any ID3 tag has already been skipped by the caller).
+/// `audio_size` is `file_size - id3_size`, used to estimate CBR frame count.
+///
+/// Returns `Some((frame_count, sample_rate))` or `None` if no valid frame found.
+pub fn probe_duration(data: &[u8], audio_size: u64) -> Option<(u64, u32)> {
+    let mut i = 0;
     while i + 4 <= data.len() {
         match memchr(0xFF, &data[i..]) {
             None    => break,
             Some(d) => i += d,
         }
-        match decode_header(data, i) {
-            Some((frame_size, sr)) => {
-                sample_rate = sr;
-                count += 1;
-                i += frame_size;
-            }
-            None => i += 1,
-        }
-    }
+        if let Some((frame_size, sr)) = decode_header(data, i) {
+            // Side-info size depends on MPEG version and channel mode.
+            let version      = (data[i + 1] >> 3) & 0x3;
+            let channel_mode = (data[i + 3] >> 6) & 0x3; // 3 = mono
+            let side_info: usize = match (version, channel_mode) {
+                (0x3, 3) => 17, // MPEG1 mono
+                (0x3, _) => 32, // MPEG1 stereo
+                (_, 3)   =>  9, // MPEG2/2.5 mono
+                _        => 17, // MPEG2/2.5 stereo
+            };
 
-    if count == 0 { None } else { Some((count, sample_rate)) }
+            // Xing / Info VBR header (immediately after the side-info block).
+            let xing = i + 4 + side_info;
+            if xing + 12 <= data.len() {
+                let tag = &data[xing..xing + 4];
+                if tag == b"Xing" || tag == b"Info" {
+                    let flags = u32::from_be_bytes([data[xing+4], data[xing+5], data[xing+6], data[xing+7]]);
+                    if flags & 0x1 != 0 {
+                        let frames = u32::from_be_bytes([data[xing+8], data[xing+9], data[xing+10], data[xing+11]]) as u64;
+                        if frames > 0 { return Some((frames, sr)); }
+                    }
+                }
+            }
+
+            // VBRI header (Fraunhofer) — always at frame_start + 36.
+            let vbri = i + 36;
+            if vbri + 18 <= data.len() && &data[vbri..vbri+4] == b"VBRI" {
+                let frames = u32::from_be_bytes([data[vbri+14], data[vbri+15], data[vbri+16], data[vbri+17]]) as u64;
+                if frames > 0 { return Some((frames, sr)); }
+            }
+
+            // CBR fallback: estimate from file size and this frame's size.
+            let frames = audio_size / frame_size as u64;
+            return Some((frames, sr));
+        }
+        i += 1;
+    }
+    None
 }
 
 pub fn frames_per_chunk_for(sample_rate: u32) -> usize {
