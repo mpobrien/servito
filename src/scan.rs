@@ -88,8 +88,12 @@ pub async fn run(config: &Config) -> Result<()> {
     let mut parsed: Vec<ParsedFile> = Vec::new();
     while let Some(res) = join_set.join_next().await {
         match res.unwrap() {
-            Ok(pf)              => parsed.push(pf),
-            Err((path_str, e))  => { eprintln!("{}   skip {path_str}: {e}", crate::ts()); skipped += 1; }
+            Ok(pf) => {
+                println!("{}  parsed {}  ({:.1}s  {} frames  {}Hz)",
+                    crate::ts(), pf.path_str, pf.duration_secs, pf.frame_count, pf.sample_rate);
+                parsed.push(pf);
+            }
+            Err((path_str, e)) => { eprintln!("{}   skip {path_str}: {e}", crate::ts()); skipped += 1; }
         }
     }
 
