@@ -2,6 +2,22 @@ use crate::{config::Config, db, mp3};
 use anyhow::Result;
 use rusqlite::OptionalExtension;
 use std::path::PathBuf;
+use tokio::task::JoinSet;
+
+struct PendingFile {
+    path_str: String,
+    is_new:   bool,
+    size_bytes: i64,
+}
+
+struct ParsedFile {
+    path_str:     String,
+    is_new:       bool,
+    size_bytes:   i64,
+    duration_secs: f64,
+    frame_count:  i64,
+    sample_rate:  u32,
+}
 
 pub async fn run(config: &Config) -> Result<()> {
     let conn = db::open(&config.db)?;
@@ -9,8 +25,8 @@ pub async fn run(config: &Config) -> Result<()> {
     let candidates = expand_paths(&config.library.paths);
     println!("{} Found {} files to scan.", crate::ts(), candidates.len());
 
-    let mut added = 0u64;
-    let mut updated = 0u64;
+    // Pass 1: sequential metadata + DB check to decide what needs parsing.
+    let mut pending: Vec<PendingFile> = Vec::new();
     let mut skipped = 0u64;
 
     for path in &candidates {
@@ -21,7 +37,6 @@ pub async fn run(config: &Config) -> Result<()> {
         };
         let size_bytes = meta.len() as i64;
 
-        // Check if already in DB with same size
         let existing: Option<(i64, i64)> = conn.query_row(
             "SELECT id, size_bytes FROM tracks WHERE path = ?1",
             rusqlite::params![path_str],
@@ -35,29 +50,60 @@ pub async fn run(config: &Config) -> Result<()> {
             }
         }
 
-        // Need to parse
-        let data = match tokio::fs::read(path).await {
-            Ok(d) => d,
-            Err(e) => { eprintln!("{}   skip {path_str}: {e}", crate::ts()); skipped += 1; continue; }
-        };
-        let (frames, sample_rate) = mp3::parse_frames(&data);
-        if frames.is_empty() {
-            eprintln!("{}   skip {path_str}: no MPEG frames", crate::ts());
-            skipped += 1;
-            continue;
+        pending.push(PendingFile { path_str, is_new: existing.is_none(), size_bytes });
+    }
+
+    println!("{} {} file(s) need parsing.", crate::ts(), pending.len());
+
+    // Pass 2: parallel file reads + frame parsing.
+    let mut join_set: JoinSet<Result<ParsedFile, (String, String)>> = JoinSet::new();
+
+    for pf in pending {
+        join_set.spawn(async move {
+            let data = tokio::fs::read(&pf.path_str).await
+                .map_err(|e| (pf.path_str.clone(), e.to_string()))?;
+
+            let (frames, sample_rate) = tokio::task::spawn_blocking(move || mp3::parse_frames(&data))
+                .await
+                .unwrap();
+
+            if frames.is_empty() {
+                return Err((pf.path_str, "no MPEG frames".to_string()));
+            }
+
+            let frame_count   = frames.len() as i64;
+            let duration_secs = frame_count as f64 * 1152.0 / sample_rate as f64;
+
+            Ok(ParsedFile {
+                path_str: pf.path_str,
+                is_new:   pf.is_new,
+                size_bytes: pf.size_bytes,
+                duration_secs,
+                frame_count,
+                sample_rate,
+            })
+        });
+    }
+
+    let mut parsed: Vec<ParsedFile> = Vec::new();
+    while let Some(res) = join_set.join_next().await {
+        match res.unwrap() {
+            Ok(pf)              => parsed.push(pf),
+            Err((path_str, e))  => { eprintln!("{}   skip {path_str}: {e}", crate::ts()); skipped += 1; }
         }
+    }
 
-        let frame_count  = frames.len() as i64;
-        let duration_secs = frame_count as f64 * 1152.0 / sample_rate as f64;
+    // Pass 3: sequential DB upserts.
+    let mut added   = 0u64;
+    let mut updated = 0u64;
 
-        let is_new = existing.is_none();
-        db::upsert_track(&conn, &path_str, duration_secs, size_bytes, frame_count, sample_rate as i64)?;
-
-        if is_new {
-            println!("{}  + {path_str}  ({:.1}s  {} frames  {}Hz)", crate::ts(), duration_secs, frame_count, sample_rate);
+    for pf in parsed {
+        db::upsert_track(&conn, &pf.path_str, pf.duration_secs, pf.size_bytes, pf.frame_count, pf.sample_rate as i64)?;
+        if pf.is_new {
+            println!("{}  + {}  ({:.1}s  {} frames  {}Hz)", crate::ts(), pf.path_str, pf.duration_secs, pf.frame_count, pf.sample_rate);
             added += 1;
         } else {
-            println!("{}  ~ {path_str}  (updated)", crate::ts());
+            println!("{}  ~ {}  (updated)", crate::ts(), pf.path_str);
             updated += 1;
         }
     }
