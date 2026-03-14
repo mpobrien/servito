@@ -99,14 +99,24 @@ pub async fn run(config: &Config) -> Result<()> {
             };
             probe.truncate(n);
 
-            let audio_size = (pf.size_bytes as u64).saturating_sub(id3_size as u64);
-            let result = tokio::task::spawn_blocking(move || mp3::probe_duration(&probe, audio_size))
-                .await
-                .unwrap();
+            let (frame_count, sample_rate) = {
+                let path = pf.path_str.clone();
+                let probe_result = tokio::task::spawn_blocking(move || mp3::probe_duration(&probe))
+                    .await
+                    .unwrap();
 
-            let (frame_count, sample_rate) = match result {
-                Some((c, sr)) => (c as i64, sr),
-                None => return Err((pf.path_str, "no MPEG frames".to_string())),
+                match probe_result {
+                    mp3::ProbeResult::Known(c, sr) => (c as i64, sr),
+                    mp3::ProbeResult::Invalid => return Err((pf.path_str, "no MPEG frames".to_string())),
+                    mp3::ProbeResult::NeedsFullScan => {
+                        let data = tokio::fs::read(&path).await
+                            .map_err(|e| (pf.path_str.clone(), e.to_string()))?;
+                        match tokio::task::spawn_blocking(move || mp3::count_frames(&data)).await.unwrap() {
+                            Some((c, sr)) => (c as i64, sr),
+                            None => return Err((pf.path_str, "no MPEG frames".to_string())),
+                        }
+                    }
+                }
             };
 
             let duration_secs = frame_count as f64 * 1152.0 / sample_rate as f64;
