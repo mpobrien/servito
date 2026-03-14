@@ -57,6 +57,8 @@ pub async fn run(config: &Config) -> Result<()> {
     println!("{} {} file(s) need parsing (concurrency={concurrency}).", crate::ts(), pending.len());
 
     // Pass 2: parallel parse + immediate DB write on each result.
+    let total       = pending.len();
+    let mut done    = 0usize;
     let mut added   = 0u64;
     let mut updated = 0u64;
 
@@ -91,15 +93,22 @@ pub async fn run(config: &Config) -> Result<()> {
         match res {
             Ok(pf) => {
                 db::upsert_track(&conn, &pf.path_str, pf.duration_secs, pf.size_bytes, pf.frame_count, pf.sample_rate as i64)?;
+                done += 1;
+                let size = crate::fmt_bytes(pf.size_bytes as u64);
+                let dur  = crate::fmt_duration(pf.duration_secs as u64);
                 if pf.is_new {
-                    println!("{}  + {}  ({:.1}s  {} frames  {}Hz)", crate::ts(), pf.path_str, pf.duration_secs, pf.frame_count, pf.sample_rate);
+                    println!("{}  + {}  ({size}  {dur})  (scanned {done}/{total})", crate::ts(), pf.path_str);
                     added += 1;
                 } else {
-                    println!("{}  ~ {}  (updated)", crate::ts(), pf.path_str);
+                    println!("{}  ~ {}  ({size}  {dur})  (scanned {done}/{total})", crate::ts(), pf.path_str);
                     updated += 1;
                 }
             }
-            Err((path_str, e)) => { eprintln!("{}   skip {path_str}: {e}", crate::ts()); skipped += 1; }
+            Err((path_str, e)) => {
+                done += 1;
+                eprintln!("{}   skip {path_str}: {e}  (scanned {done}/{total})", crate::ts());
+                skipped += 1;
+            }
         }
     }
 

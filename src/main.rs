@@ -116,14 +116,14 @@ impl Stats {
     }
 }
 
-fn fmt_duration(secs: u64) -> String {
+pub fn fmt_duration(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
-fn fmt_bytes(n: u64) -> String {
+pub fn fmt_bytes(n: u64) -> String {
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * MB;
     if n >= GB      { format!("{:.2}GB", n as f64 / GB as f64) }
