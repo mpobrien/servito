@@ -981,6 +981,7 @@ dependencies = [
  "clap",
  "futures-util",
  "glob",
+ "memchr",
  "rand",
  "rusqlite",
  "serde",

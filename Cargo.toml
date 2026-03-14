@@ -18,3 +18,4 @@ toml = "0.8"
 glob = "0.3"
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
+memchr = "2"

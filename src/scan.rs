@@ -11,12 +11,12 @@ struct PendingFile {
 }
 
 struct ParsedFile {
-    path_str:     String,
-    is_new:       bool,
-    size_bytes:   i64,
+    path_str:      String,
+    is_new:        bool,
+    size_bytes:    i64,
     duration_secs: f64,
-    frame_count:  i64,
-    sample_rate:  u32,
+    frame_count:   i64,
+    sample_rate:   u32,
 }
 
 pub async fn run(config: &Config) -> Result<()> {
@@ -56,23 +56,24 @@ pub async fn run(config: &Config) -> Result<()> {
     let concurrency = std::thread::available_parallelism().map_or(4, |n| n.get());
     println!("{} {} file(s) need parsing (concurrency={concurrency}).", crate::ts(), pending.len());
 
-    // Pass 2: parallel file reads + frame parsing, capped at `concurrency`.
-    let mut parsed: Vec<ParsedFile> = Vec::new();
+    // Pass 2: parallel parse + immediate DB write on each result.
+    let mut added   = 0u64;
+    let mut updated = 0u64;
 
     let mut stream = futures_util::stream::iter(pending)
         .map(|pf| async move {
             let data = tokio::fs::read(&pf.path_str).await
                 .map_err(|e| (pf.path_str.clone(), e.to_string()))?;
 
-            let (frames, sample_rate) = tokio::task::spawn_blocking(move || mp3::parse_frames(&data))
+            let result = tokio::task::spawn_blocking(move || mp3::count_frames(&data))
                 .await
                 .unwrap();
 
-            if frames.is_empty() {
-                return Err((pf.path_str, "no MPEG frames".to_string()));
-            }
+            let (frame_count, sample_rate) = match result {
+                Some((c, sr)) => (c as i64, sr),
+                None => return Err((pf.path_str, "no MPEG frames".to_string())),
+            };
 
-            let frame_count   = frames.len() as i64;
             let duration_secs = frame_count as f64 * 1152.0 / sample_rate as f64;
 
             Ok(ParsedFile {
@@ -89,26 +90,16 @@ pub async fn run(config: &Config) -> Result<()> {
     while let Some(res) = stream.next().await {
         match res {
             Ok(pf) => {
-                println!("{}  parsed {}  ({:.1}s  {} frames  {}Hz)",
-                    crate::ts(), pf.path_str, pf.duration_secs, pf.frame_count, pf.sample_rate);
-                parsed.push(pf);
+                db::upsert_track(&conn, &pf.path_str, pf.duration_secs, pf.size_bytes, pf.frame_count, pf.sample_rate as i64)?;
+                if pf.is_new {
+                    println!("{}  + {}  ({:.1}s  {} frames  {}Hz)", crate::ts(), pf.path_str, pf.duration_secs, pf.frame_count, pf.sample_rate);
+                    added += 1;
+                } else {
+                    println!("{}  ~ {}  (updated)", crate::ts(), pf.path_str);
+                    updated += 1;
+                }
             }
             Err((path_str, e)) => { eprintln!("{}   skip {path_str}: {e}", crate::ts()); skipped += 1; }
-        }
-    }
-
-    // Pass 3: sequential DB upserts.
-    let mut added   = 0u64;
-    let mut updated = 0u64;
-
-    for pf in parsed {
-        db::upsert_track(&conn, &pf.path_str, pf.duration_secs, pf.size_bytes, pf.frame_count, pf.sample_rate as i64)?;
-        if pf.is_new {
-            println!("{}  + {}  ({:.1}s  {} frames  {}Hz)", crate::ts(), pf.path_str, pf.duration_secs, pf.frame_count, pf.sample_rate);
-            added += 1;
-        } else {
-            println!("{}  ~ {}  (updated)", crate::ts(), pf.path_str);
-            updated += 1;
         }
     }
 
