@@ -54,7 +54,7 @@ pub async fn run(config: &Config) -> Result<()> {
         pending.push(PendingFile { path_str, is_new: existing.is_none(), size_bytes });
     }
 
-    let concurrency = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let concurrency = config.library.scan_concurrency;
     println!("{} {} file(s) need parsing (concurrency={concurrency}).", crate::ts(), pending.len());
 
     // Pass 2: parallel parse + immediate DB write on each result.

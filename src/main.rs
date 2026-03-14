@@ -571,7 +571,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Library { command } => {
             let cfg = config::load(&config_path)?;
             match command {
-                LibraryCommand::Scan => scan::run(&cfg).await?,
+                LibraryCommand::Scan => {
+                    tokio::select! {
+                        result = scan::run(&cfg) => result?,
+                        _ = tokio::signal::ctrl_c() => {
+                            println!("{} Interrupted.", ts());
+                        }
+                    }
+                }
                 LibraryCommand::List => {
                     let conn = db::open(&cfg.db)?;
                     let tracks = db::list_tracks(&conn)?;
@@ -700,6 +707,11 @@ async fn stream(cfg: config::Config) -> anyhow::Result<()> {
         .with_state(state);
     let listener = TcpListener::bind(format!("0.0.0.0:{}", cfg.stream.port)).await?;
     println!("{} Streaming → http://0.0.0.0:{}/", ts(), cfg.stream.port);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            println!("{} Shutting down.", ts());
+        })
+        .await?;
     Ok(())
 }
