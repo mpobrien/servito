@@ -1,8 +1,8 @@
 use crate::{config::Config, db, mp3};
 use anyhow::Result;
+use futures_util::StreamExt;
 use rusqlite::OptionalExtension;
 use std::path::PathBuf;
-use tokio::task::JoinSet;
 
 struct PendingFile {
     path_str: String,
@@ -53,13 +53,14 @@ pub async fn run(config: &Config) -> Result<()> {
         pending.push(PendingFile { path_str, is_new: existing.is_none(), size_bytes });
     }
 
-    println!("{} {} file(s) need parsing.", crate::ts(), pending.len());
+    let concurrency = std::thread::available_parallelism().map_or(4, |n| n.get());
+    println!("{} {} file(s) need parsing (concurrency={concurrency}).", crate::ts(), pending.len());
 
-    // Pass 2: parallel file reads + frame parsing.
-    let mut join_set: JoinSet<Result<ParsedFile, (String, String)>> = JoinSet::new();
+    // Pass 2: parallel file reads + frame parsing, capped at `concurrency`.
+    let mut parsed: Vec<ParsedFile> = Vec::new();
 
-    for pf in pending {
-        join_set.spawn(async move {
+    let mut stream = futures_util::stream::iter(pending)
+        .map(|pf| async move {
             let data = tokio::fs::read(&pf.path_str).await
                 .map_err(|e| (pf.path_str.clone(), e.to_string()))?;
 
@@ -82,12 +83,11 @@ pub async fn run(config: &Config) -> Result<()> {
                 frame_count,
                 sample_rate,
             })
-        });
-    }
+        })
+        .buffer_unordered(concurrency);
 
-    let mut parsed: Vec<ParsedFile> = Vec::new();
-    while let Some(res) = join_set.join_next().await {
-        match res.unwrap() {
+    while let Some(res) = stream.next().await {
+        match res {
             Ok(pf) => {
                 println!("{}  parsed {}  ({:.1}s  {} frames  {}Hz)",
                     crate::ts(), pf.path_str, pf.duration_secs, pf.frame_count, pf.sample_rate);
