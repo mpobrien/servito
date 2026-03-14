@@ -1,5 +1,5 @@
 use crate::{config::Config, db, mp3};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use rusqlite::OptionalExtension;
 use std::path::PathBuf;
@@ -20,7 +20,8 @@ struct ParsedFile {
 }
 
 pub async fn run(config: &Config) -> Result<()> {
-    let conn = db::open(&config.db)?;
+    let conn = db::open(&config.db)
+        .with_context(|| format!("failed to open database: {}", config.db.display()))?;
 
     let candidates = expand_paths(&config.library.paths);
     println!("{} Found {} files to scan.", crate::ts(), candidates.len());

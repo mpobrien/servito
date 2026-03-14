@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -23,6 +24,8 @@ pub struct LibraryConfig {
 }
 
 pub fn load(path: &std::path::Path) -> anyhow::Result<Config> {
-    let text = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&text)?)
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+    toml::from_str(&text)
+        .with_context(|| format!("failed to parse config file: {}", path.display()))
 }

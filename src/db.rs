@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
@@ -24,7 +24,8 @@ pub struct TimelineEntry {
 }
 
 pub fn open(db_path: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path)?;
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed to open database: {}", db_path.display()))?;
     conn.execute_batch("
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS tracks (
