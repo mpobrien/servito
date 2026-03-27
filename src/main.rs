@@ -558,6 +558,22 @@ async fn broadcaster_task(
 }
 
 // ---------------------------------------------------------------------------
+// Signal handling
+// ---------------------------------------------------------------------------
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM (docker stop).
+/// PID 1 inside a container ignores both by default, so explicit handlers
+/// are required for either signal to work.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -574,7 +590,7 @@ async fn main() -> anyhow::Result<()> {
                 LibraryCommand::Scan => {
                     tokio::select! {
                         result = scan::run(&cfg) => result?,
-                        _ = tokio::signal::ctrl_c() => {
+                        _ = shutdown_signal() => {
                             println!("{} Interrupted.", ts());
                         }
                     }
@@ -709,7 +725,7 @@ async fn stream(cfg: config::Config) -> anyhow::Result<()> {
     println!("{} Streaming → http://0.0.0.0:{}/", ts(), cfg.stream.port);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
+            shutdown_signal().await;
             println!("{} Shutting down.", ts());
         })
         .await?;

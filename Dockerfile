@@ -32,6 +32,8 @@ VOLUME ["/config", "/music", "/data"]
 # Default stream port — must match [stream] port in your config.toml
 EXPOSE 8000
 
+STOPSIGNAL SIGKILL
+
 ENTRYPOINT ["servito", "-c", "/config/config.toml"]
 # Default command: run the stream server.
 # Override with "library scan" or "library list" etc. for one-off commands.
