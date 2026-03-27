@@ -475,10 +475,10 @@ async fn broadcaster_task(
         }
 
         let receiver_count = tx.receiver_count();
-        let prebuf_full = prebuffer.lock().unwrap().len() >= PREBUFFER_CHUNKS;
 
-        if receiver_count == 0 && prebuf_full {
-            // No clients and prebuffer is full — drop audio, keep virtual position.
+        if receiver_count == 0 {
+            // No clients — clear prebuffer so the next client doesn't hear stale audio.
+            prebuffer.lock().unwrap().clear();
             audio = None;
             continue;
         }
