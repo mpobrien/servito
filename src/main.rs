@@ -143,6 +143,12 @@ struct NowPlaying {
     position_secs:  f64,
 }
 
+#[derive(Clone, Serialize)]
+struct HistoryEntry {
+    title:         String,
+    duration_secs: f64,
+}
+
 #[derive(Clone)]
 struct AppState {
     tx:               Arc<broadcast::Sender<Bytes>>,
@@ -150,6 +156,7 @@ struct AppState {
     avg_bitrate_kbps: Arc<AtomicU32>,
     current_meta:     Arc<Mutex<String>>,
     now_playing:      Arc<Mutex<Option<NowPlaying>>>,
+    history:          Arc<Mutex<VecDeque<HistoryEntry>>>,
     stats:            Stats,
 }
 
@@ -358,6 +365,102 @@ async fn nowplaying_handler(State(state): State<AppState>) -> Response {
     }
 }
 
+#[derive(Serialize)]
+struct StatusResponse {
+    now_playing:    Option<NowPlaying>,
+    clients_active: u32,
+    history:        Vec<HistoryEntry>,
+}
+
+async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let now_playing    = state.now_playing.lock().unwrap().clone();
+    let clients_active = state.stats.clients_active.load(Ordering::Relaxed);
+    let history        = state.history.lock().unwrap().iter().cloned().collect();
+    Json(StatusResponse { now_playing, clients_active, history })
+}
+
+const UI_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>servito</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#eee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:2.5rem 2rem;max-width:580px;margin:0 auto}
+header{font-size:.75rem;letter-spacing:.25em;text-transform:uppercase;opacity:.35;margin-bottom:2.5rem}
+#track-title{font-size:1.5rem;font-weight:600;margin-bottom:.75rem;min-height:2rem;word-break:break-word}
+.bar-wrap{background:#2a2a2a;border-radius:2px;height:3px;margin-bottom:.5rem}
+.bar-fill{background:#c0392b;height:100%;border-radius:2px;transition:width 1s linear;width:0%}
+#time{font-size:.8rem;color:#666;margin-bottom:1.75rem}
+#listeners{font-size:.9rem;color:#999;margin-bottom:1.75rem}
+#listeners b{color:#eee}
+audio{width:100%;margin-bottom:2.5rem}
+h2{font-size:.75rem;letter-spacing:.15em;text-transform:uppercase;opacity:.35;margin-bottom:.75rem}
+#history-list{list-style:none}
+#history-list li{display:flex;justify-content:space-between;align-items:baseline;padding:.55rem 0;border-bottom:1px solid #1e1e1e;font-size:.9rem}
+#history-list li .dur{color:#555;flex-shrink:0;margin-left:1.5rem;font-size:.8rem}
+#history-list li:first-child{border-top:1px solid #1e1e1e}
+</style>
+</head>
+<body>
+<header>servito</header>
+<div id="track-title">—</div>
+<div class="bar-wrap"><div class="bar-fill" id="bar"></div></div>
+<div id="time"></div>
+<div id="listeners"><b id="lcount">0</b> listening</div>
+<audio controls src="/" preload="none"></audio>
+<h2>Recently Played</h2>
+<ul id="history-list"></ul>
+<script>
+function fmt(s){s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;return h>0?h+':'+pad(m)+':'+pad(sec):m+':'+pad(sec)}
+function pad(n){return String(n).padStart(2,'0')}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+async function refresh(){
+  try{
+    var d=await(await fetch('/status')).json();
+    var np=d.now_playing;
+    if(np){
+      document.getElementById('track-title').textContent=np.title;
+      document.getElementById('bar').style.width=(np.duration_secs>0?np.position_secs/np.duration_secs*100:0)+'%';
+      document.getElementById('time').textContent=fmt(np.position_secs)+' / '+fmt(np.duration_secs);
+    }else{
+      document.getElementById('track-title').textContent='—';
+      document.getElementById('bar').style.width='0%';
+      document.getElementById('time').textContent='';
+    }
+    document.getElementById('lcount').textContent=d.clients_active;
+    var ul=document.getElementById('history-list');
+    ul.innerHTML='';
+    (d.history||[]).forEach(function(h){
+      var li=document.createElement('li');
+      li.innerHTML='<span>'+esc(h.title)+'</span><span class="dur">'+fmt(h.duration_secs)+'</span>';
+      ul.appendChild(li);
+    });
+  }catch(e){}
+}
+setInterval(refresh,2000);
+refresh();
+</script>
+</body>
+</html>"#;
+
+async fn ui_handler() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(UI_HTML))
+        .unwrap()
+}
+
+fn push_to_history(now_playing: &Mutex<Option<NowPlaying>>, history: &Mutex<VecDeque<HistoryEntry>>) {
+    if let Some(np) = now_playing.lock().unwrap().clone() {
+        let mut h = history.lock().unwrap();
+        h.push_front(HistoryEntry { title: np.title, duration_secs: np.duration_secs });
+        h.truncate(20);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Virtual playhead broadcaster
 // ---------------------------------------------------------------------------
@@ -414,6 +517,7 @@ async fn broadcaster_task(
     avg_bitrate_kbps: Arc<AtomicU32>,
     current_meta: Arc<Mutex<String>>,
     now_playing:  Arc<Mutex<Option<NowPlaying>>>,
+    history:      Arc<Mutex<VecDeque<HistoryEntry>>>,
     stats:        Stats,
 ) {
     let conn = match db::open(&db_path) {
@@ -448,6 +552,7 @@ async fn broadcaster_task(
             match db::get_entry_after(&conn, entry.position) {
                 Ok(next) => {
                     if entry.track_id != next.track_id {
+                        push_to_history(&now_playing, &history);
                         println!("{} [track] {}", ts(), next.path);
                         update_track_state(&next, &current_meta, &now_playing, now);
                     }
@@ -459,6 +564,7 @@ async fn broadcaster_task(
                     let _ = db::ensure_timeline_covers(&conn, now, now + 3600.0);
                     match db::get_entry_after(&conn, entry.position) {
                         Ok(next) => {
+                            push_to_history(&now_playing, &history);
                             update_track_state(&next, &current_meta, &now_playing, now);
                             entry = next;
                             audio = None;
@@ -524,6 +630,7 @@ async fn broadcaster_task(
                 // Track exhausted — advance to next entry.
                 match db::get_entry_after(&conn, entry.position) {
                     Ok(next) => {
+                        push_to_history(&now_playing, &history);
                         println!("{} [track] {}", ts(), next.path);
                         update_track_state(&next, &current_meta, &now_playing, unix_now());
                         entry = next;
@@ -658,6 +765,7 @@ async fn stream(cfg: config::Config) -> anyhow::Result<()> {
     let avg_bitrate_kbps: Arc<AtomicU32> = Arc::new(AtomicU32::new(128));
     let current_meta: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let now_playing: Arc<Mutex<Option<NowPlaying>>> = Arc::new(Mutex::new(None));
+    let history: Arc<Mutex<VecDeque<HistoryEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     // Broadcaster task.
     {
@@ -666,11 +774,12 @@ async fn stream(cfg: config::Config) -> anyhow::Result<()> {
         let avg_br_bg    = avg_bitrate_kbps.clone();
         let meta_bg      = current_meta.clone();
         let np_bg        = now_playing.clone();
+        let history_bg   = history.clone();
         let stats_bg     = stats.clone();
         let db_path      = cfg.db.clone();
 
         tokio::spawn(async move {
-            broadcaster_task(db_path, tx_bg, prebuffer_bg, avg_br_bg, meta_bg, np_bg, stats_bg).await;
+            broadcaster_task(db_path, tx_bg, prebuffer_bg, avg_br_bg, meta_bg, np_bg, history_bg, stats_bg).await;
         });
     }
 
@@ -714,12 +823,15 @@ async fn stream(cfg: config::Config) -> anyhow::Result<()> {
         avg_bitrate_kbps,
         current_meta,
         now_playing,
+        history,
         stats,
     };
 
     let app      = Router::new()
         .route("/", get(stream_handler))
         .route("/nowplaying", get(nowplaying_handler))
+        .route("/status", get(status_handler))
+        .route("/ui", get(ui_handler))
         .with_state(state);
     let listener = TcpListener::bind(format!("0.0.0.0:{}", cfg.stream.port)).await?;
     println!("{} Streaming → http://0.0.0.0:{}/", ts(), cfg.stream.port);
