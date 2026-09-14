@@ -8,7 +8,7 @@
 - Stores track metadata in a local SQLite database
 - Builds a randomized playback timeline from the scanned library
 - Serves a live MP3 stream over HTTP with ICY metadata
-- Exposes `nowplaying`, `status`, and a simple built-in web UI
+- Exposes `/nowplaying`, `/status`, and a simple built-in web UI at `/ui`
 
 ## Requirements
 
@@ -78,7 +78,7 @@ Start the stream server:
 servito -c /path/to/config.toml stream
 ```
 
-Print the currently playing track from a running local server:
+Print the currently playing track from a running local server by querying `/nowplaying`:
 
 ```sh
 servito -c /path/to/config.toml now-playing
