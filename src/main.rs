@@ -51,15 +51,20 @@ enum Command {
         #[command(subcommand)]
         command: LibraryCommand,
     },
-    /// Start the HTTP stream server
+    /// Start the HTTP stream server (all configured channels, one port)
     Stream,
-    /// Show what is currently playing on a running stream
-    NowPlaying,
+    /// List configured channels and how many tracks each has
+    Channels,
+    /// Show what is currently playing on a channel of a running stream
+    NowPlaying {
+        /// Channel name (defaults to the only channel, if there's just one)
+        channel: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum LibraryCommand {
-    /// Scan configured paths and add new/changed files to the library
+    /// Scan configured channel paths and add new/changed files to the library
     Scan,
     /// List all tracks in the library
     List,
@@ -102,13 +107,13 @@ impl Stats {
         }
     }
 
-    fn print(&self, label: &str) {
+    fn print(&self, channel: &str, label: &str) {
         let active   = self.clients_active.load(Ordering::Relaxed);
         let total    = self.clients_total.load(Ordering::Relaxed);
         let read     = self.bytes_read.load(Ordering::Relaxed);
         let streamed = self.bytes_streamed.load(Ordering::Relaxed);
         println!(
-            "{} [{label}] clients={active}  total={total}  read={}  streamed={}",
+            "{} [{channel}] [{label}] clients={active}  total={total}  read={}  streamed={}",
             ts(),
             fmt_bytes(read),
             fmt_bytes(streamed),
@@ -149,8 +154,13 @@ struct HistoryEntry {
     duration_secs: f64,
 }
 
+/// Per-channel state. Each channel has its own broadcaster task, its own
+/// listeners, and its own now-playing/history — channels are entirely
+/// independent streams that just happen to share one HTTP server and track
+/// library.
 #[derive(Clone)]
 struct AppState {
+    name:             Arc<str>,
     tx:               Arc<broadcast::Sender<Bytes>>,
     prebuffer:        Arc<Mutex<VecDeque<Bytes>>>,
     avg_bitrate_kbps: Arc<AtomicU32>,
@@ -166,13 +176,14 @@ struct AppState {
 
 struct ClientGuard {
     id:    u64,
+    name:  Arc<str>,
     stats: Stats,
 }
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.stats.clients_active.fetch_sub(1, Ordering::Relaxed);
-        self.stats.print(&format!("disconnect id={}", self.id));
+        self.stats.print(&self.name, &format!("disconnect id={}", self.id));
     }
 }
 
@@ -217,21 +228,25 @@ async fn stream_handler(
     let prebuf: Vec<Bytes> = state.prebuffer.lock().unwrap().iter().cloned().collect();
     let avg_br  = state.avg_bitrate_kbps.load(Ordering::Relaxed);
 
-    state.stats.print(&format!("connect id={id}"));
+    state.stats.print(&state.name, &format!("connect id={id}"));
 
-    let guard        = ClientGuard { id, stats: state.stats.clone() };
+    let guard        = ClientGuard { id, name: state.name.clone(), stats: state.stats.clone() };
     let stats_stream = state.stats.clone();
     let meta_state   = state.current_meta.clone();
+    let name_lag     = state.name.clone();
 
     let prebuf_stream = futures_util::stream::iter(prebuf)
         .map(Ok::<_, std::convert::Infallible>);
 
-    let live_stream = BroadcastStream::new(rx).filter_map(move |r| async move {
-        match r {
-            Ok(bytes) => Some(bytes),
-            Err(BroadcastStreamRecvError::Lagged(n)) => {
-                println!("{} [client {id}] lagged, skipped {n} chunk(s)", ts());
-                None
+    let live_stream = BroadcastStream::new(rx).filter_map(move |r| {
+        let name_lag = name_lag.clone();
+        async move {
+            match r {
+                Ok(bytes) => Some(bytes),
+                Err(BroadcastStreamRecvError::Lagged(n)) => {
+                    println!("{} [{name_lag}] [client {id}] lagged, skipped {n} chunk(s)", ts());
+                    None
+                }
             }
         }
     });
@@ -321,7 +336,7 @@ async fn stream_handler(
             .header("Accept-Ranges", "none")
             .header("icy-br", avg_br.to_string())
             .header("icy-metaint", ICY_METAINT.to_string())
-            .header("icy-name", "stream")
+            .header("icy-name", state.name.to_string())
             .header("icy-pub", "0")
             .body(Body::from_stream(body_stream))
             .unwrap()
@@ -348,7 +363,7 @@ async fn stream_handler(
             .header("Connection", "keep-alive")
             .header("Accept-Ranges", "none")
             .header("icy-br", avg_br.to_string())
-            .header("icy-name", "stream")
+            .header("icy-name", state.name.to_string())
             .header("icy-pub", "0")
             .body(Body::from_stream(body_stream))
             .unwrap()
@@ -379,16 +394,17 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(StatusResponse { now_playing, clients_active, history })
 }
 
-const UI_HTML: &str = r#"<!DOCTYPE html>
+const UI_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>servito</title>
+<title>servito — {{CHANNEL}}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#111;color:#eee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:2.5rem 2rem;max-width:580px;margin:0 auto}
 header{font-size:.75rem;letter-spacing:.25em;text-transform:uppercase;opacity:.35;margin-bottom:2.5rem}
+header a{color:inherit;text-decoration:none}
 #track-title{font-size:1.5rem;font-weight:600;margin-bottom:.75rem;min-height:2rem;word-break:break-word}
 .bar-wrap{background:#2a2a2a;border-radius:2px;height:3px;margin-bottom:.5rem}
 .bar-fill{background:#c0392b;height:100%;border-radius:2px;transition:width 1s linear;width:0%}
@@ -404,12 +420,12 @@ h2{font-size:.75rem;letter-spacing:.15em;text-transform:uppercase;opacity:.35;ma
 </style>
 </head>
 <body>
-<header>servito</header>
+<header><a href="/">servito</a> · {{CHANNEL}}</header>
 <div id="track-title">—</div>
 <div class="bar-wrap"><div class="bar-fill" id="bar"></div></div>
 <div id="time"></div>
 <div id="listeners"><b id="lcount">0</b> listening</div>
-<audio controls src="/" preload="none"></audio>
+<audio controls src="/{{CHANNEL}}" preload="none"></audio>
 <h2>Recently Played</h2>
 <ul id="history-list"></ul>
 <script>
@@ -418,7 +434,7 @@ function pad(n){return String(n).padStart(2,'0')}
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 async function refresh(){
   try{
-    var d=await(await fetch('/status')).json();
+    var d=await(await fetch('/{{CHANNEL}}/status')).json();
     var np=d.now_playing;
     if(np){
       document.getElementById('track-title').textContent=np.title;
@@ -445,12 +461,46 @@ refresh();
 </body>
 </html>"#;
 
-async fn ui_handler() -> Response {
+fn ui_html(channel: &str) -> String {
+    UI_HTML_TEMPLATE.replace("{{CHANNEL}}", channel)
+}
+
+async fn ui_handler(State(state): State<AppState>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(UI_HTML))
+        .body(Body::from(ui_html(&state.name)))
         .unwrap()
+}
+
+const INDEX_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>servito</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#eee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:2.5rem 2rem;max-width:580px;margin:0 auto}
+header{font-size:.75rem;letter-spacing:.25em;text-transform:uppercase;opacity:.35;margin-bottom:2.5rem}
+ul{list-style:none}
+li{padding:.55rem 0;border-bottom:1px solid #1e1e1e}
+li:first-child{border-top:1px solid #1e1e1e}
+a{color:#eee;text-decoration:none;font-size:1rem}
+a:hover{color:#c0392b}
+</style>
+</head>
+<body>
+<header>servito</header>
+<ul>{{LINKS}}</ul>
+</body>
+</html>"#;
+
+fn index_html(names: &[String]) -> String {
+    let links: String = names.iter()
+        .map(|n| format!(r#"<li><a href="/{n}/ui">{n}</a></li>"#))
+        .collect();
+    INDEX_HTML_TEMPLATE.replace("{{LINKS}}", &links)
 }
 
 fn push_to_history(now_playing: &Mutex<Option<NowPlaying>>, history: &Mutex<VecDeque<HistoryEntry>>) {
@@ -510,8 +560,11 @@ fn update_track_state(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn broadcaster_task(
     db_path:      std::path::PathBuf,
+    channel_id:   i64,
+    channel_name: String,
     tx:           Arc<broadcast::Sender<Bytes>>,
     prebuffer:    Arc<Mutex<VecDeque<Bytes>>>,
     avg_bitrate_kbps: Arc<AtomicU32>,
@@ -522,15 +575,15 @@ async fn broadcaster_task(
 ) {
     let conn = match db::open(&db_path) {
         Ok(c) => c,
-        Err(e) => { eprintln!("{} [broadcaster] failed to open DB: {e}", ts()); return; }
+        Err(e) => { eprintln!("{} [{channel_name}] failed to open DB: {e}", ts()); return; }
     };
 
     let now = unix_now();
 
     // Get the first timeline entry covering right now.
-    let mut entry = match db::get_entry_at(&conn, now) {
+    let mut entry = match db::get_entry_at(&conn, channel_id, now) {
         Ok(e) => e,
-        Err(e) => { eprintln!("{} [broadcaster] no timeline entry at startup: {e}", ts()); return; }
+        Err(e) => { eprintln!("{} [{channel_name}] no timeline entry at startup: {e}", ts()); return; }
     };
     update_track_state(&entry, &current_meta, &now_playing, now);
 
@@ -549,11 +602,11 @@ async fn broadcaster_task(
             let track_end = entry.virtual_start_secs + entry.duration_secs;
             if now < track_end { break; }
             // Current track ended in virtual time. Advance.
-            match db::get_entry_after(&conn, entry.position) {
+            match db::get_entry_after(&conn, channel_id, entry.position) {
                 Ok(next) => {
                     if entry.track_id != next.track_id {
                         push_to_history(&now_playing, &history);
-                        println!("{} [track] {}", ts(), next.path);
+                        println!("{} [{channel_name}] [track] {}", ts(), next.path);
                         update_track_state(&next, &current_meta, &now_playing, now);
                     }
                     entry = next;
@@ -561,15 +614,15 @@ async fn broadcaster_task(
                 }
                 Err(e) => {
                     // Extend timeline and retry
-                    let _ = db::ensure_timeline_covers(&conn, now, now + 3600.0);
-                    match db::get_entry_after(&conn, entry.position) {
+                    let _ = db::ensure_timeline_covers(&conn, channel_id, now, now + 3600.0);
+                    match db::get_entry_after(&conn, channel_id, entry.position) {
                         Ok(next) => {
                             push_to_history(&now_playing, &history);
                             update_track_state(&next, &current_meta, &now_playing, now);
                             entry = next;
                             audio = None;
                         }
-                        Err(e2) => { eprintln!("{} [broadcaster] timeline gap: {e} / {e2}", ts()); break; }
+                        Err(e2) => { eprintln!("{} [{channel_name}] timeline gap: {e} / {e2}", ts()); break; }
                     }
                 }
             }
@@ -593,12 +646,12 @@ async fn broadcaster_task(
         if audio.is_none() {
             let data = match fs::read(&entry.path).await {
                 Ok(d) => d,
-                Err(e) => { eprintln!("{} [broadcaster] failed to read {}: {e}", ts(), entry.path); continue; }
+                Err(e) => { eprintln!("{} [{channel_name}] failed to read {}: {e}", ts(), entry.path); continue; }
             };
             stats.bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
             let (frames, sample_rate) = mp3::parse_frames(&data);
             if frames.is_empty() {
-                eprintln!("{} [broadcaster] no frames in {}", ts(), entry.path);
+                eprintln!("{} [{channel_name}] no frames in {}", ts(), entry.path);
                 continue;
             }
 
@@ -615,7 +668,7 @@ async fn broadcaster_task(
             let frames_elapsed = (elapsed * sample_rate as f64 / 1152.0) as usize;
             let frame_idx = frames_elapsed.min(frames.len().saturating_sub(1));
 
-            println!("{} [broadcaster] loading {} @ frame {}/{}", ts(), entry.path, frame_idx, frames.len());
+            println!("{} [{channel_name}] loading {} @ frame {}/{}", ts(), entry.path, frame_idx, frames.len());
 
             audio = Some(LoadedAudio { data, frames, frame_idx, fpc });
         }
@@ -628,17 +681,17 @@ async fn broadcaster_task(
         while remaining > 0 {
             if loaded.frame_idx >= loaded.frames.len() {
                 // Track exhausted — advance to next entry.
-                match db::get_entry_after(&conn, entry.position) {
+                match db::get_entry_after(&conn, channel_id, entry.position) {
                     Ok(next) => {
                         push_to_history(&now_playing, &history);
-                        println!("{} [track] {}", ts(), next.path);
+                        println!("{} [{channel_name}] [track] {}", ts(), next.path);
                         update_track_state(&next, &current_meta, &now_playing, unix_now());
                         entry = next;
                         audio = None;
                         break; // emit partial chunk and reload next tick
                     }
                     Err(_) => {
-                        let _ = db::ensure_timeline_covers(&conn, unix_now(), unix_now() + 3600.0);
+                        let _ = db::ensure_timeline_covers(&conn, channel_id, unix_now(), unix_now() + 3600.0);
                         break;
                     }
                 }
@@ -726,12 +779,31 @@ async fn main() -> anyhow::Result<()> {
             let cfg = config::load(&config_path)?;
             stream(cfg).await?;
         }
-        Command::NowPlaying => {
+        Command::Channels => {
             let cfg = config::load(&config_path)?;
-            let url = format!("http://127.0.0.1:{}/nowplaying", cfg.stream.port);
+            let conn = db::open(&cfg.db)?;
+            println!("{:<24}  {:>6}", "Channel", "Tracks");
+            println!("{}", "-".repeat(34));
+            for ch in &cfg.channels {
+                let channel_id = db::upsert_channel(&conn, &ch.name)?;
+                let count = db::count_channel_tracks(&conn, channel_id)?;
+                println!("{:<24}  {:>6}", ch.name, count);
+            }
+        }
+        Command::NowPlaying { channel } => {
+            let cfg = config::load(&config_path)?;
+            let name = match channel {
+                Some(n) => n,
+                None if cfg.channels.len() == 1 => cfg.channels[0].name.clone(),
+                None => {
+                    let names: Vec<&str> = cfg.channels.iter().map(|c| c.name.as_str()).collect();
+                    anyhow::bail!("multiple channels configured — specify one: {}", names.join(", "));
+                }
+            };
+            let url = format!("http://127.0.0.1:{}/{}/nowplaying", cfg.stream.port, name);
             let np: NowPlaying = ureq::get(&url)
                 .call()
-                .map_err(|e| anyhow::anyhow!("could not reach stream: {e}"))?
+                .map_err(|e| anyhow::anyhow!("could not reach channel '{name}': {e}"))?
                 .into_json()?;
             let pos = np.position_secs as u64;
             let dur = np.duration_secs as u64;
@@ -746,95 +818,141 @@ async fn main() -> anyhow::Result<()> {
 
 async fn stream(cfg: config::Config) -> anyhow::Result<()> {
     let conn = db::open(&cfg.db)?;
-    let track_count = db::count_tracks(&conn)?;
-    if track_count == 0 {
-        anyhow::bail!("Library is empty — run 'streamer scan <config>' first");
-    }
-    println!("{} Library: {} tracks", ts(), track_count);
 
-    // Seed the timeline starting now.
+    // Only mount channels that actually have tracks — an empty channel would
+    // just hang waiting for a timeline entry that can never be created.
+    let mut active_channels: Vec<(config::ChannelConfig, i64)> = Vec::new();
+    for ch in &cfg.channels {
+        let channel_id = db::upsert_channel(&conn, &ch.name)?;
+        let count = db::count_channel_tracks(&conn, channel_id)?;
+        if count == 0 {
+            eprintln!("{} [{}] no tracks assigned — skipping this channel.", ts(), ch.name);
+            continue;
+        }
+        println!("{} [{}] {} tracks", ts(), ch.name, count);
+        active_channels.push((ch.clone(), channel_id));
+    }
+    if active_channels.is_empty() {
+        anyhow::bail!("no channel has any tracks — run 'servito library scan' first");
+    }
+
+    // Seed each channel's timeline starting now.
     let now = unix_now();
-    db::ensure_timeline_covers(&conn, now, now + 7200.0)?;
+    for (_, channel_id) in &active_channels {
+        db::ensure_timeline_covers(&conn, *channel_id, now, now + 7200.0)?;
+    }
     drop(conn);
 
-    let stats = Stats::new();
+    let channel_names: Vec<String> = active_channels.iter().map(|(c, _)| c.name.clone()).collect();
+    let index_body = index_html(&channel_names);
 
-    let (tx, _)  = broadcast::channel::<Bytes>(256);
-    let tx       = Arc::new(tx);
-    let prebuffer: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let avg_bitrate_kbps: Arc<AtomicU32> = Arc::new(AtomicU32::new(128));
-    let current_meta: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let now_playing: Arc<Mutex<Option<NowPlaying>>> = Arc::new(Mutex::new(None));
-    let history: Arc<Mutex<VecDeque<HistoryEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let mut app = Router::new().route("/", get(move || {
+        let index_body = index_body.clone();
+        async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(Body::from(index_body))
+                .unwrap()
+        }
+    }));
 
-    // Broadcaster task.
-    {
-        let tx_bg        = tx.clone();
-        let prebuffer_bg = prebuffer.clone();
-        let avg_br_bg    = avg_bitrate_kbps.clone();
-        let meta_bg      = current_meta.clone();
-        let np_bg        = now_playing.clone();
-        let history_bg   = history.clone();
-        let stats_bg     = stats.clone();
-        let db_path      = cfg.db.clone();
+    for (ch, channel_id) in active_channels {
+        let stats = Stats::new();
 
-        tokio::spawn(async move {
-            broadcaster_task(db_path, tx_bg, prebuffer_bg, avg_br_bg, meta_bg, np_bg, history_bg, stats_bg).await;
-        });
+        let (tx, _)  = broadcast::channel::<Bytes>(256);
+        let tx       = Arc::new(tx);
+        let prebuffer: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let avg_bitrate_kbps: Arc<AtomicU32> = Arc::new(AtomicU32::new(128));
+        let current_meta: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let now_playing: Arc<Mutex<Option<NowPlaying>>> = Arc::new(Mutex::new(None));
+        let history: Arc<Mutex<VecDeque<HistoryEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let name: Arc<str> = Arc::from(ch.name.as_str());
+
+        // Broadcaster task.
+        {
+            let tx_bg        = tx.clone();
+            let prebuffer_bg = prebuffer.clone();
+            let avg_br_bg    = avg_bitrate_kbps.clone();
+            let meta_bg      = current_meta.clone();
+            let np_bg        = now_playing.clone();
+            let history_bg   = history.clone();
+            let stats_bg     = stats.clone();
+            let db_path      = cfg.db.clone();
+            let channel_name = ch.name.clone();
+
+            tokio::spawn(async move {
+                broadcaster_task(db_path, channel_id, channel_name, tx_bg, prebuffer_bg, avg_br_bg, meta_bg, np_bg, history_bg, stats_bg).await;
+            });
+        }
+
+        // Periodic stats logger.
+        if cfg.stream.log_interval_secs > 0 {
+            let stats_log    = stats.clone();
+            let np_log       = now_playing.clone();
+            let interval     = cfg.stream.log_interval_secs;
+            let channel_name = ch.name.clone();
+            tokio::spawn(async move {
+                let mut ticker = time::interval(Duration::from_secs(interval));
+                ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let track_info = np_log.lock().unwrap().as_ref().map(|np| {
+                        let title = std::path::Path::new(&np.path)
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| np.path.clone());
+                        let pos = np.position_secs as u64;
+                        let rem = (np.duration_secs - np.position_secs).max(0.0) as u64;
+                        format!("  track=\"{}\"  pos={}  rem={}", title, fmt_duration(pos), fmt_duration(rem))
+                    }).unwrap_or_default();
+                    let active   = stats_log.clients_active.load(Ordering::Relaxed);
+                    let total    = stats_log.clients_total.load(Ordering::Relaxed);
+                    let read     = stats_log.bytes_read.load(Ordering::Relaxed);
+                    let streamed = stats_log.bytes_streamed.load(Ordering::Relaxed);
+                    println!(
+                        "{} [{channel_name}] [stats] clients={active}  total={total}  read={}  streamed={}{}",
+                        ts(), fmt_bytes(read), fmt_bytes(streamed), track_info,
+                    );
+                }
+            });
+        }
+
+        let state = AppState {
+            name,
+            tx,
+            prebuffer,
+            avg_bitrate_kbps,
+            current_meta,
+            now_playing,
+            history,
+            stats,
+        };
+
+        let channel_router = Router::new()
+            .route("/", get(stream_handler))
+            .route("/nowplaying", get(nowplaying_handler))
+            .route("/status", get(status_handler))
+            .route("/ui", get(ui_handler))
+            .with_state(state.clone());
+
+        // `nest("/name", ..)` maps bare "/name" to the inner "/" route but
+        // *not* "/name/" (the remainder after stripping the prefix is ""
+        // rather than "/"). Register that trailing-slash form explicitly too
+        // since it's the natural way to type/copy a stream URL.
+        app = app
+            .route(&format!("/{}/", ch.name), get(stream_handler).with_state(state))
+            .nest(&format!("/{}", ch.name), channel_router);
     }
 
     println!("{} Ready.", ts());
 
-    // Periodic stats logger.
-    if cfg.stream.log_interval_secs > 0 {
-        let stats_log = stats.clone();
-        let np_log    = now_playing.clone();
-        let interval  = cfg.stream.log_interval_secs;
-        tokio::spawn(async move {
-            let mut ticker = time::interval(Duration::from_secs(interval));
-            ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let track_info = np_log.lock().unwrap().as_ref().map(|np| {
-                    let title = std::path::Path::new(&np.path)
-                        .file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| np.path.clone());
-                    let pos = np.position_secs as u64;
-                    let rem = (np.duration_secs - np.position_secs).max(0.0) as u64;
-                    format!("  track=\"{}\"  pos={}  rem={}", title, fmt_duration(pos), fmt_duration(rem))
-                }).unwrap_or_default();
-                let active   = stats_log.clients_active.load(Ordering::Relaxed);
-                let total    = stats_log.clients_total.load(Ordering::Relaxed);
-                let read     = stats_log.bytes_read.load(Ordering::Relaxed);
-                let streamed = stats_log.bytes_streamed.load(Ordering::Relaxed);
-                println!(
-                    "{} [stats] clients={active}  total={total}  read={}  streamed={}{}",
-                    ts(), fmt_bytes(read), fmt_bytes(streamed), track_info,
-                );
-            }
-        });
-    }
-
-    let state = AppState {
-        tx,
-        prebuffer,
-        avg_bitrate_kbps,
-        current_meta,
-        now_playing,
-        history,
-        stats,
-    };
-
-    let app      = Router::new()
-        .route("/", get(stream_handler))
-        .route("/nowplaying", get(nowplaying_handler))
-        .route("/status", get(status_handler))
-        .route("/ui", get(ui_handler))
-        .with_state(state);
     let listener = TcpListener::bind(format!("0.0.0.0:{}", cfg.stream.port)).await?;
     println!("{} Streaming → http://0.0.0.0:{}/", ts(), cfg.stream.port);
+    for name in &channel_names {
+        println!("{}   http://0.0.0.0:{}/{}/", ts(), cfg.stream.port, name);
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_signal().await;

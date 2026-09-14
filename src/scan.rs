@@ -2,12 +2,14 @@ use crate::{config::Config, db, mp3};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use rusqlite::OptionalExtension;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 struct PendingFile {
-    path_str: String,
-    is_new:   bool,
-    size_bytes: i64,
+    path_str:    String,
+    is_new:      bool,
+    size_bytes:  i64,
+    channel_ids: Vec<i64>,
 }
 
 struct ParsedFile {
@@ -17,14 +19,29 @@ struct ParsedFile {
     duration_secs: f64,
     frame_count:   i64,
     sample_rate:   u32,
+    channel_ids:   Vec<i64>,
 }
 
 pub async fn run(config: &Config) -> Result<()> {
     let conn = db::open(&config.db)
         .with_context(|| format!("failed to open database: {}", config.db.display()))?;
 
-    let candidates = expand_paths(&config.library.paths);
-    println!("{} Found {} files to scan.", crate::ts(), candidates.len());
+    // Ensure a channel row exists for every configured channel, and expand
+    // each channel's patterns to find out which file(s) it covers.
+    let mut path_channels: HashMap<PathBuf, Vec<i64>> = HashMap::new();
+    for ch in &config.channels {
+        let channel_id = db::upsert_channel(&conn, &ch.name)?;
+        for path in expand_paths(&ch.paths) {
+            path_channels.entry(path).or_default().push(channel_id);
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = path_channels.keys().cloned().collect();
+    candidates.sort();
+    println!(
+        "{} Found {} file(s) across {} channel(s).",
+        crate::ts(), candidates.len(), config.channels.len()
+    );
 
     // Pass 1: sequential metadata + DB check to decide what needs parsing.
     let mut pending: Vec<PendingFile> = Vec::new();
@@ -32,6 +49,8 @@ pub async fn run(config: &Config) -> Result<()> {
 
     for path in &candidates {
         let path_str = path.to_string_lossy().to_string();
+        let channel_ids = path_channels.remove(path).unwrap_or_default();
+
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => { eprintln!("{}   skip {path_str}: {e}", crate::ts()); skipped += 1; continue; }
@@ -44,17 +63,20 @@ pub async fn run(config: &Config) -> Result<()> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional()?;
 
-        if let Some((_, db_size)) = existing {
-            if db_size == size_bytes {
-                skipped += 1;
-                continue;
-            }
+        if let Some((track_id, db_size)) = existing
+            && db_size == size_bytes
+        {
+            // File contents unchanged, but which channels reference it
+            // may have — keep that in sync even when we skip re-parsing.
+            db::set_track_channels(&conn, track_id, &channel_ids)?;
+            skipped += 1;
+            continue;
         }
 
-        pending.push(PendingFile { path_str, is_new: existing.is_none(), size_bytes });
+        pending.push(PendingFile { path_str, is_new: existing.is_none(), size_bytes, channel_ids });
     }
 
-    let concurrency = config.library.scan_concurrency;
+    let concurrency = config.scan_concurrency;
     println!("{} {} file(s) need parsing (concurrency={concurrency}).", crate::ts(), pending.len());
 
     // Pass 2: parallel parse + immediate DB write on each result.
@@ -129,6 +151,7 @@ pub async fn run(config: &Config) -> Result<()> {
                 duration_secs,
                 frame_count,
                 sample_rate,
+                channel_ids: pf.channel_ids,
             })
         })
         .buffer_unordered(concurrency);
@@ -136,7 +159,8 @@ pub async fn run(config: &Config) -> Result<()> {
     while let Some(res) = stream.next().await {
         match res {
             Ok(pf) => {
-                db::upsert_track(&conn, &pf.path_str, pf.duration_secs, pf.size_bytes, pf.frame_count, pf.sample_rate as i64)?;
+                let track_id = db::upsert_track(&conn, &pf.path_str, pf.duration_secs, pf.size_bytes, pf.frame_count, pf.sample_rate as i64)?;
+                db::set_track_channels(&conn, track_id, &pf.channel_ids)?;
                 done += 1;
                 let size = crate::fmt_bytes(pf.size_bytes as u64);
                 let dur  = crate::fmt_duration(pf.duration_secs as u64);
@@ -158,6 +182,10 @@ pub async fn run(config: &Config) -> Result<()> {
 
     println!("{} Scan complete: {} added, {} updated, {} unchanged.", crate::ts(), added, updated, skipped);
     println!("{} Library total: {} tracks.", crate::ts(), db::count_tracks(&conn)?);
+    for ch in &config.channels {
+        let channel_id = db::upsert_channel(&conn, &ch.name)?;
+        println!("{}   channel '{}': {} track(s)", crate::ts(), ch.name, db::count_channel_tracks(&conn, channel_id)?);
+    }
     Ok(())
 }
 
