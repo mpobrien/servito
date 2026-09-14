@@ -42,9 +42,9 @@ paths = [
   "/music",
   "/music/**/*.mp3",
 ]
-# Optional. If omitted, servito chooses a default based on CPU count.
-scan_concurrency = 16
 ```
+
+`scan_concurrency` is optional. If you omit it, `servito` chooses a default based on available CPU parallelism.
 
 ## Usage
 
