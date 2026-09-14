@@ -42,9 +42,11 @@ paths = [
   "/music",
   "/music/**/*.mp3",
 ]
+# Optional: add this under [library] to override the default.
+# scan_concurrency = 16
 ```
 
-`scan_concurrency` is optional. If you omit it, `servito` chooses a default based on available CPU parallelism.
+`scan_concurrency` is optional under `[library]`. If you omit it, `servito` chooses a default based on available CPU parallelism.
 
 ## Usage
 
@@ -100,6 +102,8 @@ Build the image:
 ```sh
 docker build -t servito .
 ```
+
+When running in Docker, make sure the config mounted at `/config/config.toml` uses container paths such as `db = "/data/servito.db"` and library paths under `/music`, so the mounted volumes match the config.
 
 Run the stream server:
 
